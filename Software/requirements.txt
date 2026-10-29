@@ -1,0 +1,19 @@
+# Stewart Platform - Raspberry Pi Python dependencies
+# Install inside a virtual environment:  pip install -r requirements.txt
+# Target: 64-bit Raspberry Pi OS (aarch64), Python 3.11+
+
+# Vision pipeline (cv2.aruco, warpPerspective, HSV masking, imshow).
+# text.py REQUIRES OpenCV >= 4.7 (cv2.aruco.ArucoDetector); there is no
+# fallback for the older detectMarkers API. Pinned to the 4.x line because
+# text.py hasn't been tested against OpenCV 5.x.
+# Verify after install:
+#   python -c "import cv2; print(cv2.__version__, hasattr(cv2.aruco, 'ArucoDetector'))"
+# Do NOT also install opencv-python / opencv-contrib-python-headless; they
+# all provide the same cv2 module and conflict with each other.
+opencv-contrib-python==4.14.0.94
+
+# Array math. 2.4.x still supports Python 3.11 (Bookworm); 2.5+ needs 3.12+.
+numpy==2.4.6
+
+# Serial link to the Arduino servo driver (not used by text.py yet).
+pyserial==3.5
