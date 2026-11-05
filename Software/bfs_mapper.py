@@ -1,16 +1,15 @@
 from collections import deque
-import numpy as np
 
-def bfs_path_dir(bfs_list):
-    start = (0,0)
+def bfs_path_dir(bfs_list, start, target_cell):
+    if bfs_list[start[1]][start[0]] == 1:
+        return None, None  # start is inside a wall
     double_queue = deque([start])
     visited = {start}
     path = {}
     path[start] = None
-    target_cell = (26,26)
     while double_queue:
         cur_cell = double_queue.popleft()
-        if cur_cell == target_cell or len(visited) >= 27*27:
+        if cur_cell == target_cell:
             break
         x, y = cur_cell
         if checker((x, y - 1),visited,bfs_list): # Up
@@ -59,11 +58,18 @@ def bfs_path_dir(bfs_list):
             directions.append("down")
         elif step == (-1, 0):
             directions.append("left")
-    
-    return path_finder, directions
+
+    waypoints = [path_finder[0]] # Important points
+    segment_dirs = [] # Important direction
+    for i in range(len(directions)):
+        if i == len(directions) - 1 or directions[i] != directions[i + 1]:
+            waypoints.append(path_finder[i + 1])
+            segment_dirs.append(directions[i])
+
+    return waypoints, segment_dirs
 
 def checker(coordinates_,visited_set,bfs_list):
-    if coordinates_[0] > 26 or coordinates_[0] < 0 or coordinates_[1] > 26 or coordinates_[1] < 0:
+    if coordinates_[0] >= len(bfs_list[0]) or coordinates_[0] < 0 or coordinates_[1] >= len(bfs_list) or coordinates_[1] < 0:
         return False
     elif bfs_list[coordinates_[1]][coordinates_[0]] == 1:
         return False

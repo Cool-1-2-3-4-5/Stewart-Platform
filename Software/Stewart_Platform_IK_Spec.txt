@@ -1,0 +1,446 @@
+STEWART PLATFORM MAZE SOLVER - INVERSE KINEMATICS SPECIFICATION
+================================================================
+Project:  6-servo rotary Stewart platform that tilts a maze to roll a ball to a goal.
+Location: WATiMake makerspace, University of Waterloo.
+Purpose of this file: a complete, self-contained description of the hardware and
+the inverse-kinematics (IK) math, so that a person or another LLM can repeat the
+derivation and the numbers without any other context.
+
+Conventions used in this file
+  - Plain ASCII. "*" = multiply, "^" = power, "sqrt" = square root.
+  - "." between two vectors = dot product. |v| = length of vector v.
+  - Vectors are written (x, y, z). Angles in the math are RADIANS unless marked "deg".
+  - Lengths are MILLIMETRES (mm).
+  - Values marked [UNMEASURED] are placeholders and must be measured on the build.
+  - Values marked [CONFIRM] are my best understanding and should be checked.
+
+Sections
+  1. System overview
+  2. Hardware specifications
+  3. Platform geometry (what the IK depends on)
+  4. Coordinate frames and sign conventions
+  5. Symbols
+  6. Derivation worksheet (steps with hints and checks, no answers)
+  7. Reference solution (full answers; skip this if you want to derive it yourself)
+  8. Test vectors (numbers to check an implementation against)
+  9. Known limitations of this geometry
+ 10. Open items / things to measure
+
+
+----------------------------------------------------------------------
+1. SYSTEM OVERVIEW
+----------------------------------------------------------------------
+Data flow:
+  Camera (Pi Camera Module 3)
+    -> Raspberry Pi 5: OpenCV finds 4 ArUco tags, warps the image to a flat
+       300 x 300 px top-down view of the maze, and finds the ball's (x, y).
+    -> At startup only: the maze image is thresholded into a 300 x 300
+       occupancy grid and BFS computes the shortest path as corner waypoints.
+    -> Every frame: an RL policy (not written yet) picks a platform pose.
+    -> IK (this document) turns that pose into 6 servo angles.
+    -> Servo angles are sent to a microcontroller that drives the 6 servos
+       (ESP32 over UDP per the latest plan; Arduino over serial was the earlier
+       plan) [CONFIRM which one].
+
+Software files (folder: Software/):
+  Computer_vision.py   camera, ArUco, homography, warp, ball tracking loop
+  Maze_Analyser.py     one-shot maze snapshot -> 300x300 occupancy grid
+  bfs_mapper.py        BFS shortest path -> corner waypoints + directions
+  ik_core.py           generic rotary Stewart IK (written for a PAIRED servo
+                       layout by default; see section 7.8 to configure it for
+                       this build)
+  requirements.txt     Pi 5 install notes and pinned packages
+
+
+----------------------------------------------------------------------
+2. HARDWARE SPECIFICATIONS
+----------------------------------------------------------------------
+Compute
+  Board:            Raspberry Pi 5
+  OS:               64-bit Raspberry Pi OS Trixie (Python 3.13) recommended
+  Packages:         opencv-contrib-python 4.14.0.94, numpy 2.4.6 (pip, in a venv
+                    created with --system-site-packages); python3-picamera2 (apt)
+
+Camera
+  Model:            Raspberry Pi Camera Module 3 (Sony IMX708 sensor, autofocus)
+  Interface:        CSI ribbon to the Pi 5 (needs the Pi 5 22-pin cable)
+  Capture:          640 x 480, 60 FPS, picamera2 "RGB888" (stored as B,G,R)
+  At startup:       one autofocus cycle, then lens held; exposure and white
+                    balance locked after 1 s
+  Mounting height:  [UNMEASURED] (mm above the maze floor)
+
+Actuators
+  Count:            6 rotary hobby servos
+  Model:            [UNMEASURED]
+  Command range:    0 to 180 deg (hard limit; every command is clipped)
+  Neutral:          command at which the horn is horizontal [UNMEASURED per
+                    servo; 90 deg assumed]
+
+Maze (from Mechanical/STL and DXF/Maze.STL)
+  Outer size:       150 mm x 150 mm
+  Floor:            top surface at z = 2 mm in the STL (2 mm thick base)
+  Walls:            11 mm tall (STL z from 2 mm to 13 mm)
+  Outer wall:       3.0 mm thick
+  Inner walls:      4.57 mm thick (32/7 mm in the CAD)
+  Path width:       14.0 mm
+  Row pitch:        18.57 mm (14 path + 4.57 wall); 8 rows. Vertical walls are
+                    NOT all on a regular column grid.
+  Colours:          white floor, black walls
+  Mass:             [UNMEASURED]
+
+Ball (from Mechanical/STL and DXF/Ball.STL)
+  Diameter:         11.0 mm (radius 5.5 mm)
+  Colour:           orange
+  Clearance:        14 - 11 = 3 mm total, 1.5 mm each side when centred
+
+Markers
+  Type:             ArUco, dictionary DICT_4X4_50
+  IDs and sides:    ID 1 = Top, ID 2 = Right, ID 3 = Bottom, ID 4 = Left
+  Placement:        centre of each tag at the midpoint of one side of the maze
+  Warp:             tag centres map to (150,0), (300,150), (150,300), (0,150)
+                    in a 300 x 300 px image
+  Tag centre to opposite tag centre: [UNMEASURED] (code placeholder 170 mm)
+
+
+----------------------------------------------------------------------
+3. PLATFORM GEOMETRY (WHAT THE IK DEPENDS ON)
+----------------------------------------------------------------------
+  G1. Six servos, EVENLY spaced around a circle of radius R_b: one every 60 deg.
+      There are no servo pairs.
+  G2. Each servo body sits radially, so its output shaft points straight out
+      from the platform centre (shaft axis is horizontal and radial).
+  G3. Therefore each horn swings in a VERTICAL plane that is TANGENT to the base
+      circle (the plane containing the tangent direction and straight up).
+  G4. All six horns point the SAME rotational direction around the circle when
+      horizontal. This file assumes COUNTER-CLOCKWISE when viewed from above
+      [CONFIRM]. If they are clockwise, see section 7.9.
+  G5. Each rod is EXACTLY VERTICAL at the home pose: every platform joint sits
+      directly above its horn tip when all horns are horizontal.
+  G6. Joints at both rod ends are ball joints (rods carry only push/pull).
+  G7. Servo i drives leg i; platform joint i is the joint above horn i.
+
+Consequences of G5 (derived in section 7):
+  - Platform joint radius R_p = sqrt(R_b^2 + a^2). It is not measured separately.
+  - Platform joints are rotated counter-clockwise from the servos by
+    delta = atan2(a, R_b).
+  - Home height h0 = s (the rod length).
+
+Measured inputs needed (only three):
+  R_b  centre -> servo shaft axis, measured horizontally   [UNMEASURED]
+  a    horn length: shaft axis -> horn ball-joint centre   [UNMEASURED]
+  s    rod length: ball-joint centre -> ball-joint centre  [UNMEASURED]
+Measure joint CENTRES, not part edges.
+
+
+----------------------------------------------------------------------
+4. COORDINATE FRAMES AND SIGN CONVENTIONS
+----------------------------------------------------------------------
+Base frame {B} (fixed to the ground)
+  Origin: centre of the servo-shaft circle, at the height of the shaft axes.
+  +z: straight up.
+  +x: horizontal, pointing from the centre toward servo 1.
+  +y: horizontal, 90 deg counter-clockwise from +x when viewed from above
+      (right-handed frame).
+
+Platform frame {P} (fixed to the moving platform)
+  Origin: centre of the six platform joints.
+  Axes: identical to {B} at the home pose.
+  The six joints lie in the plane z = 0 of {P}.
+
+Servo numbering
+  Servo i (i = 1..6) sits at angle theta_i = (i - 1) * 60 deg, measured
+  counter-clockwise from +x viewed from above. Servo 1 at 0 deg, servo 2 at
+  60 deg, ..., servo 6 at 300 deg.
+
+Pose (the IK input), all relative to the home pose
+  x, y, z         translation of the {P} origin [mm]
+  phi             roll  = rotation about +x [rad]
+  theta           pitch = rotation about +y [rad]
+  psi             yaw   = rotation about +z [rad]
+  Positive angles follow the right-hand rule.
+  Rotation order: R = Rz(psi) * Ry(theta) * Rx(phi)
+  (equivalent to: roll first, then pitch, then yaw, all about the fixed base axes).
+
+Horn angle (the IK output, before conversion to a servo command)
+  alpha_i = angle of horn i above horizontal [rad].
+  alpha_i = 0 means horizontal. alpha_i > 0 means the horn tip is raised.
+
+Not yet defined [CONFIRM]: which maze side (tag ID) lies along +x. This is
+needed to turn "ball should roll toward +x in the camera image" into a roll or
+pitch sign. Record the angle from +x (servo 1) to the Right tag (ID 2).
+
+
+----------------------------------------------------------------------
+5. SYMBOLS
+----------------------------------------------------------------------
+  R_b       base radius (centre -> shaft axis)                 mm
+  a         horn length                                        mm
+  s         rod length                                         mm
+  theta_i   angular position of servo i                        rad
+  b_i       position of servo i shaft pivot, in {B}            mm (vector)
+  u_i       unit radial direction at servo i                   (vector)
+  t_i       unit tangent direction of horn i at alpha = 0      (vector)
+  k         unit vector straight up = (0, 0, 1)
+  p_i       position of platform joint i, in {P}               mm (vector)
+  R_p       platform joint radius                              mm
+  delta     angular offset of joints from servos               rad
+  h0        home height of {P} above {B}                       mm
+  R         3x3 rotation matrix of the platform
+  T         translation of the platform = (x, y, h0 + z)       mm (vector)
+  q_i       platform joint i in {B} for the current pose       mm (vector)
+  l_i       leg vector = q_i - b_i                             mm (vector)
+  H_i       horn tip i in {B}                                  mm (vector)
+  alpha_i   horn angle above horizontal                        rad
+  M, N, L   coefficients of the rod equation (section 7.6)
+  cmd_i     servo command                                      deg
+
+
+----------------------------------------------------------------------
+6. DERIVATION WORKSHEET (HINTS AND CHECKS, NO ANSWERS)
+----------------------------------------------------------------------
+Step 0. Draw two pictures.
+  Top view: six servos at 60 deg spacing, each horn along the tangent (all
+  counter-clockwise), and each platform joint directly above its horn tip.
+  Side view of one leg looking along the radius: horn at angle alpha, rod up
+  to the joint.
+
+Step 1. Write theta_i and b_i.
+  Hint:  b_i lies on a circle of radius R_b at z = 0.
+  Check: |b_i| = R_b; the six points form a regular hexagon.
+
+Step 2. Write u_i and t_i.
+  Hint:  t_i is u_i rotated 90 deg counter-clockwise in the horizontal plane.
+  Check: t_i . b_i = 0, |t_i| = 1, t_i has z = 0.
+
+Step 3. Write p_i, R_p and delta.
+  Hint:  the rod is vertical at home, so joint i has the same x and y as horn
+         tip i at alpha = 0. That tip is b_i + a * t_i.
+  Check: all six |p_i| are equal.
+
+Step 4. Find h0.
+  Hint:  at home the horn tip is at z = 0 and the rod is vertical.
+
+Step 5. Write Rx, Ry, Rz and R = Rz * Ry * Rx.
+  Check: R = identity when all angles are 0; R keeps vector lengths.
+
+Step 6. Write q_i and l_i.
+  Hint:  q_i = T + R * p_i, l_i = q_i - b_i.
+  Check: at home, l_i = a * t_i + h0 * k.
+
+Step 7. Write H_i(alpha).
+  Hint:  the horn swings in the plane spanned by t_i and k.
+  Check: |H_i - b_i| = a for all alpha; at alpha = 0 it is b_i + a * t_i.
+
+Step 8. Write the rod constraint |q_i - H_i| = s and square it.
+
+Step 9. Rearrange into M * sin(alpha) + N * cos(alpha) = L.
+  Hint:  M involves the z part of l_i; N involves the part of l_i along t_i.
+
+Step 10. Solve for alpha.
+  Hint:  harmonic addition / auxiliary angle: write M sin + N cos as a single
+         sine of (alpha + something), then use arcsin.
+  Check: no solution when |L| > sqrt(M^2 + N^2); choose the branch that gives
+         alpha = 0 at home.
+
+Step 11. Convert to a servo command and clip to 0..180 deg.
+
+
+----------------------------------------------------------------------
+7. REFERENCE SOLUTION
+----------------------------------------------------------------------
+7.1 Servo positions
+  theta_i = (i - 1) * pi / 3                     i = 1..6
+  u_i     = (cos theta_i, sin theta_i, 0)
+  b_i     = R_b * u_i
+
+7.2 Horn direction (counter-clockwise tangent)
+  t_i = (-sin theta_i, cos theta_i, 0)
+  k   = (0, 0, 1)
+
+7.3 Platform joints (in {P})
+  p_i   = b_i + a * t_i
+        = (R_b cos theta_i - a sin theta_i,  R_b sin theta_i + a cos theta_i,  0)
+  R_p   = |p_i| = sqrt(R_b^2 + a^2)
+  delta = atan2(a, R_b)
+  Equivalently p_i = R_p * (cos(theta_i + delta), sin(theta_i + delta), 0).
+
+7.4 Home height
+  At home: H_i = b_i + a * t_i (z = 0) and q_i = p_i + h0 * k.
+  q_i - H_i = (0, 0, h0), whose length must equal s, so
+  h0 = s
+
+7.5 Rotation
+  Rx(phi)   = [ 1      0          0        ]
+              [ 0      cos phi   -sin phi  ]
+              [ 0      sin phi    cos phi  ]
+
+  Ry(theta) = [ cos theta   0   sin theta ]
+              [ 0           1   0         ]
+              [ -sin theta  0   cos theta ]
+
+  Rz(psi)   = [ cos psi  -sin psi   0 ]
+              [ sin psi   cos psi   0 ]
+              [ 0         0         1 ]
+
+  R = Rz(psi) * Ry(theta) * Rx(phi)
+  Written out (c = cos, s = sin):
+    R = [ c_psi c_th   c_psi s_th s_phi - s_psi c_phi   c_psi s_th c_phi + s_psi s_phi ]
+        [ s_psi c_th   s_psi s_th s_phi + c_psi c_phi   s_psi s_th c_phi - c_psi s_phi ]
+        [ -s_th        c_th s_phi                       c_th c_phi                     ]
+
+7.6 Leg vector and rod equation
+  T   = (x, y, h0 + z)
+  q_i = T + R * p_i
+  l_i = q_i - b_i
+
+  Horn tip:  H_i(alpha) = b_i + a * (cos(alpha) * t_i + sin(alpha) * k)
+
+  Rod constraint:
+    |q_i - H_i|^2 = s^2
+    |l_i - a (cos(alpha) t_i + sin(alpha) k)|^2 = s^2
+
+  Expand. t_i and k are perpendicular unit vectors, so the squared horn term
+  equals a^2:
+    |l_i|^2 - 2a cos(alpha) (l_i . t_i) - 2a sin(alpha) (l_i . k) + a^2 = s^2
+
+  Rearrange into M sin(alpha) + N cos(alpha) = L with
+    M = 2 a (l_i . k)   = 2 a l_iz
+    N = 2 a (l_i . t_i) = 2 a ( -sin theta_i * l_ix + cos theta_i * l_iy )
+    L = |l_i|^2 + a^2 - s^2
+
+7.7 Solving for alpha
+  Let rho = sqrt(M^2 + N^2) and gamma = atan2(N, M).
+  Then M sin(alpha) + N cos(alpha) = rho * sin(alpha + gamma).
+  (Check: rho sin(alpha + gamma) = rho sin(alpha) cos(gamma) + rho cos(alpha) sin(gamma),
+   with rho cos(gamma) = M and rho sin(gamma) = N.)
+
+  So sin(alpha + gamma) = L / rho, and
+    alpha_i = asin(L / rho) - gamma
+
+  Reachability: if |L / rho| > 1 there is no real solution. The pose is
+  unreachable; reject it and hold the previous command.
+
+  Branch: the other solution, alpha = pi - asin(L / rho) - gamma, puts the horn
+  near vertical at home and is never used.
+
+  Home check: l_i = a t_i + s k, so |l_i|^2 = a^2 + s^2, l_iz = s, l_i . t_i = a.
+    M = 2 a s,  N = 2 a^2,  L = 2 a^2
+    rho = 2 a sqrt(s^2 + a^2),  L / rho = a / sqrt(s^2 + a^2)
+    asin(a / sqrt(s^2 + a^2)) = atan(a / s) = atan2(2a^2, 2as) = gamma
+    alpha_i = 0   (correct)
+
+7.8 Servo command
+  cmd_i = neutral_i + dir_i * alpha_i * 180 / pi      [deg]
+  cmd_i = clip(cmd_i, 0, 180)
+  neutral_i: command that makes horn i horizontal [UNMEASURED, ~90].
+  dir_i:     +1 if increasing the command raises the horn tip, else -1.
+             All horns turn the same way, so all six should share one sign
+             [CONFIRM on hardware, one servo at a time, with the rods off].
+
+  Configuring ik_core.py for this build (it defaults to a paired layout):
+    import numpy as np
+    from ik_core import StewartIK
+    th = np.arange(6) * np.pi / 3
+    ik = StewartIK(base_radius=R_b, horn_length=a, rod_length=s,
+                   platform_radius=np.hypot(R_b, a),
+                   base_angles_rad=th,
+                   platform_angles_rad=th + np.arctan2(a, R_b),
+                   horn_plane_rad=th + np.pi / 2,
+                   servo_direction=(1, 1, 1, 1, 1, 1))
+  ik_core.py computes h0 itself; it should come out equal to s. Its formula is
+  identical to 7.6-7.7 with t_i = (cos beta_i, sin beta_i, 0), beta_i = theta_i + 90 deg.
+
+7.9 If the horns actually point CLOCKWISE
+  Use t_i = (sin theta_i, -cos theta_i, 0) and delta = -atan2(a, R_b).
+  Everything else is unchanged. (In ik_core.py: horn_plane_rad = th - pi/2 and
+  platform_angles_rad = th - arctan2(a, R_b).)
+
+7.10 Small-angle approximations (useful for checks and for the RL action design)
+  For small motions, alpha_i ~= (change in height of joint i) / a, because the
+  rod is vertical and the horn is horizontal at home.
+  Joint i in {B} at home: (R_p cos(theta_i + delta), R_p sin(theta_i + delta), s).
+    Heave z:       alpha_i ~= z / a                              (all equal)
+    Roll phi:      alpha_i ~= ( R_p sin(theta_i + delta) / a ) * phi
+    Pitch theta:   alpha_i ~= ( -R_p cos(theta_i + delta) / a ) * theta
+    x, y, yaw:     alpha_i ~= 0 to first order (see section 9)
+
+
+----------------------------------------------------------------------
+8. TEST VECTORS
+----------------------------------------------------------------------
+Example geometry (NOT the real build; used only to check an implementation):
+  R_b = 100 mm,  a = 25 mm,  s = 150 mm,  horns counter-clockwise.
+Derived:
+  R_p   = sqrt(100^2 + 25^2) = 103.078 mm
+  delta = atan2(25, 100)     = 0.24498 rad = 14.036 deg
+  h0    = 150 mm
+
+Test A - home pose (0, 0, 0, 0, 0, 0)
+  Expected: alpha_i = 0 for all six.
+
+Test B - heave z = +3 mm, everything else 0
+  For every leg: l_i = a t_i + (s + 3) k
+    |l_i|^2 = 25^2 + 153^2 = 625 + 23409 = 24034
+    L = 24034 + 625 - 22500 = 2159
+    M = 2 * 25 * 153 = 7650
+    N = 2 * 25 * 25 = 1250
+    rho = sqrt(7650^2 + 1250^2) = sqrt(60085000) = 7751.45
+    L / rho = 0.278529
+    asin(0.278529) = 0.28228 rad
+    gamma = atan2(1250, 7650) = 0.16197 rad
+    alpha_i = 0.12029 rad = 6.892 deg   (all six equal; exact solver value,
+                                         hand rounding above gives 0.1203)
+  Small-angle estimate: 3 / 25 = 0.120 rad. Matches.
+
+Test C - roll phi = +2 deg (0.034907 rad), everything else 0
+  Small-angle prediction: alpha_i ~= (R_b sin theta_i + a cos theta_i) / a * phi
+  Exact solver (section 7):              small-angle estimate:
+    servo 1 (theta   0): +0.03491 rad  +2.000 deg     +0.0349 rad
+    servo 2 (theta  60): +0.13880 rad  +7.952 deg     +0.1384 rad
+    servo 3 (theta 120): +0.10363 rad  +5.938 deg     +0.1035 rad
+    servo 4 (theta 180): -0.03491 rad  -2.000 deg     -0.0349 rad
+    servo 5 (theta 240): -0.13878 rad  -7.952 deg     -0.1384 rad
+    servo 6 (theta 300): -0.10363 rad  -5.937 deg     -0.1035 rad
+  Pattern: servos on the +y side rise, servos on the -y side drop, by equal and
+  opposite amounts.
+
+Test D - unreachable pose, e.g. z = +40 mm (more than the horn length 25 mm)
+  Expected: |L / rho| > 1 for at least one leg -> solver reports unreachable.
+
+Test E - yaw psi = +2 deg, everything else 0
+  Exact solver: alpha_i = +0.00173 rad = +0.099 deg for all six.
+  A 2 deg yaw moves the servos only 0.1 deg (second-order effect only), which
+  is why yaw cannot be controlled or resisted at home (section 9).
+
+Test D exact result: all six legs unreachable.
+
+
+----------------------------------------------------------------------
+9. KNOWN LIMITATIONS OF THIS GEOMETRY
+----------------------------------------------------------------------
+  - With all six rods exactly vertical at home, the rods can only push up and
+    down. Small x, y and yaw motions barely change any rod's height, so the IK
+    returns alpha ~= 0 for them and the servos cannot hold the platform against
+    those motions (it is a singular configuration at home). The owner has
+    chosen to accept this. For maze tilting, command only roll, pitch and
+    (optionally) z; keep x = y = psi = 0.
+  - Pose limits are not yet set. Suggested starting envelope for testing:
+    |phi|, |theta| <= 10 deg, |z| <= 5 mm. Raise only after checking for
+    mechanical interference.
+  - Servo limits: commands are clipped to 0..180 deg. Clipping silently
+    changes the pose, so the controller should prefer poses well inside it.
+
+
+----------------------------------------------------------------------
+10. OPEN ITEMS / THINGS TO MEASURE
+----------------------------------------------------------------------
+  [ ] R_b, a, s (joint centres, mm)
+  [ ] Confirm horns point counter-clockwise viewed from above (else use 7.9)
+  [ ] Neutral command (horn horizontal) for each servo
+  [ ] Direction sign for each servo (expected the same for all six)
+  [ ] Servo model and its true angle range
+  [ ] Angle from +x (servo 1) to the Right ArUco tag (ID 2), to link camera
+      directions to roll/pitch signs
+  [ ] Camera height above the maze floor
+  [ ] Tag centre to opposite tag centre distance (for TAG_SPAN_MM)
+  [ ] Microcontroller link: ESP32 over UDP or Arduino over serial

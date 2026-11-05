@@ -3,7 +3,7 @@ Stewart Platform Maze Solver - Vision Pipeline
 ==============================================
 
 Pipeline (per frame):
-    1. Grab a 640x480 frame from the webcam (low latency, high FPS).
+    1. Grab a 640x480 frame from the Pi Camera Module 3 (picamera2, Raspberry Pi 5).
     2. Detect ArUco tags (DICT_4X4_50) sitting at the midpoints of the maze's 4 sides.
     3. Compute each tag's center by averaging its 4 corners.
     4. Map tag IDs to fixed physical sides (1=Top, 2=Right, 3=Bottom, 4=Left).
@@ -20,11 +20,15 @@ Press 'q' in any debug window to quit.
 import time
 import cv2
 import numpy as np
+from picamera2 import Picamera2
+from libcamera import controls
 
 # Global Variables
-CAMERA_INDEX = 0
-FRAME_W, FRAME_H = 640, 480     # Low resolution keeps capture + detection fast on a Pi
-TARGET_FPS = 60                 # Requested; the camera will clamp to what it supports
+CAMERA_INDEX = 0                # Pi 5 camera port: 0 = CAM/DISP 0, 1 = CAM/DISP 1
+FRAME_W, FRAME_H = 640, 480     # Low resolution keeps capture + detection fast on a Pi. Sensor is 16:9, so 4:3 crops the sides
+TARGET_FPS = 60                 # Fixed frame rate; also caps exposure time at 1/60 s
+CAMERA_SETTLE_S = 1.0           # Time for auto-exposure / white balance to settle before locking
+LOCK_EXPOSURE = True            # Freeze exposure + white balance after startup so HSV colours stay constant
 WARP_SIZE = 300                 # Output top-down view is WARP_SIZE x WARP_SIZE pixels
 
 # Using differnt ideas since Yaw would change their positions
@@ -71,25 +75,34 @@ SHOW_DEBUG = True
 # Startup Functions
 
 def open_camera():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+    cam = Picamera2(CAMERA_INDEX)
+    frame_us = int(1_000_000 / TARGET_FPS)
+    config = cam.create_video_configuration(
+        main={"size": (FRAME_W, FRAME_H), "format": "RGB888"},  # "RGB888" is stored B,G,R: what OpenCV expects
+        controls={"FrameDurationLimits": (frame_us, frame_us)},
+        queue=False,  # capture_array() waits for a fresh frame instead of returning a queued, older one
+    )
+    cam.configure(config)
+    cam.start()
+    time.sleep(CAMERA_SETTLE_S)  # let auto-exposure and white balance settle
 
-    # MJPG lets most USB webcams deliver higher FPS than raw YUYV at 640x480.
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    # Focus once on the maze, then hold the lens there so it doesn't refocus while the platform tilts
+    cam.set_controls({"AfMode": controls.AfModeEnum.Auto})
+    if not cam.autofocus_cycle():
+        print("[camera] Autofocus did not converge; check the image is sharp")
 
-    # Keep the driver queue short so we always process the newest frame, not a
-    # stale one. Not every backend honors this, but it's harmless if ignored.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if LOCK_EXPOSURE:
+        md = cam.capture_metadata()
+        cam.set_controls({
+            "AeEnable": False, "AwbEnable": False,
+            "ExposureTime": md["ExposureTime"],
+            "AnalogueGain": md["AnalogueGain"],
+            "ColourGains": md["ColourGains"],
+        })
+        print(f"[camera] Locked exposure {md['ExposureTime']} us, gain {md['AnalogueGain']:.2f}")
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    actual_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"[camera] {actual_w}x{actual_h} @ {actual_fps:.0f} FPS (requested)")
-    return cap
+    print(f"[camera] Pi Camera {FRAME_W}x{FRAME_H} @ {TARGET_FPS} FPS")
+    return cam
 
 
 def create_aruco_detector():
@@ -118,7 +131,7 @@ def compute_homography(centers):
         if tag_id not in centers:
             return None
     src_points = np.array([centers[1],centers[2],centers[3],centers[4]], dtype=np.float32)
-    if not cv2.isContourConvex(src.reshape(-1, 1, 2)): # ensures lines connected them are not twisted (no bowties)
+    if not cv2.isContourConvex(src_points.reshape(-1, 1, 2)): # ensures lines connected them are not twisted (no bowties)
         return None
     signed_area = cv2.contourArea(src_points, oriented=True)
     if abs(signed_area) < MIN_QUAD_AREA_PX:
@@ -155,7 +168,7 @@ def detect_ball(warped, lower, upper):
 # Main
 
 def main():
-    cap = open_camera()
+    cam = open_camera()
     aruco_detector = create_aruco_detector()
     lower, upper = HSV_BOUNDS[BALL_COLOR]
 
@@ -167,18 +180,9 @@ def main():
     fps = 0.0
     prev_t = time.monotonic()
 
-    consecutive_read_failures = 0
-
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                consecutive_read_failures += 1
-                if consecutive_read_failures > 30:
-                    print("[camera] Lost camera feed, exiting.")
-                    break
-                continue
-            consecutive_read_failures = 0
+            frame = cam.capture_array()  # raises an error if the camera stops, instead of returning ok=False
             now = time.monotonic()
 
             # ArUco detection (grayscale is needed)
@@ -249,7 +253,7 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
-        cap.release()
+        cam.close()
         cv2.destroyAllWindows()
 
 

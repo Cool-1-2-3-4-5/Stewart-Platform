@@ -1,19 +1,29 @@
-# Stewart Platform - Raspberry Pi Python dependencies
-# Install inside a virtual environment:  pip install -r requirements.txt
-# Target: 64-bit Raspberry Pi OS (aarch64), Python 3.11+
+# Stewart Platform - Raspberry Pi 5 Python dependencies
+# Target: 64-bit Raspberry Pi OS Trixie (Python 3.13) with the Pi Camera Module 3.
+#
+# The camera library comes from apt, NOT pip, because it needs the system libcamera:
+#   sudo apt install -y python3-picamera2
+# The venv must be able to see that system package, so create it like this:
+#   python3 -m venv --system-site-packages ~/stewart-env
+#   source ~/stewart-env/bin/activate
+#   pip install -r requirements.txt
+#
+# Verify:
+#   rpicam-hello --list-cameras        (should list imx708 = Camera Module 3)
+#   python -c "import cv2, picamera2; print(cv2.__version__, hasattr(cv2.aruco, 'ArucoDetector'))"
+#                                      (should print 4.14.0 True)
 
-# Vision pipeline (cv2.aruco, warpPerspective, HSV masking, imshow).
-# text.py REQUIRES OpenCV >= 4.7 (cv2.aruco.ArucoDetector); there is no
-# fallback for the older detectMarkers API. Pinned to the 4.x line because
-# text.py hasn't been tested against OpenCV 5.x.
-# Verify after install:
-#   python -c "import cv2; print(cv2.__version__, hasattr(cv2.aruco, 'ArucoDetector'))"
-# Do NOT also install opencv-python / opencv-contrib-python-headless; they
-# all provide the same cv2 module and conflict with each other.
+# Vision pipeline (cv2.aruco, warpPerspective, HSV masking, imshow over VNC).
+# Computer_vision.py REQUIRES OpenCV >= 4.7 (cv2.aruco.ArucoDetector); there is no
+# fallback for the older API. Pinned to 4.x because the code isn't tested on OpenCV 5.
+# Do NOT also install opencv-python / opencv-contrib-python-headless or apt python3-opencv;
+# they all provide the same cv2 module and conflict.
 opencv-contrib-python==4.14.0.94
 
-# Array math. 2.4.x still supports Python 3.11 (Bookworm); 2.5+ needs 3.12+.
+# OpenCV 4.14 requires NumPy >= 2. Trixie's system NumPy (used by apt picamera2) is 2.x,
+# so this is compatible. On Bookworm the system NumPy is 1.x and mixing it with
+# NumPy 2 in the venv can break the picamera2 import; use Trixie to avoid that.
 numpy==2.4.6
 
-# Serial link to the Arduino servo driver (not used by text.py yet).
+# Serial link to an Arduino servo driver. Not used yet; not needed if the ESP32 link is UDP.
 pyserial==3.5
