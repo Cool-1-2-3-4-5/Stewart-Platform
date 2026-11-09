@@ -9,7 +9,7 @@ WALL_THRESHOLD = 127
 def Maze_Reader():
     cam = open_camera()
     frame = cam.capture_array()
-    cam.close()  # free the camera so Computer_vision.main() can use it
+    cam.close()  # free the camera
     cv2.imwrite("maze_snapshot.png", frame)
 
     detector = create_aruco_detector()
@@ -23,11 +23,24 @@ def Maze_Reader():
 
     warped_gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(warped_gray, WALL_THRESHOLD, 1, cv2.THRESH_BINARY_INV)
-    cv2.imwrite("maze_binary.png", binary * 255)  # * 255 so walls show white in the saved image
+    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+    blue = cv2.inRange(hsv, (95, 80, 50), (130, 255, 255))  # blue range, tune if needed
+    binary[blue > 0] = 0
+    cv2.imwrite("maze_binary.png", binary * 255)
 
     px_per_mm = WARP_SIZE / TAG_SPAN_MM
-    r = max(1, round(DILATE_MM * px_per_mm)) # how much to dilate in pixels
+    r = max(1, round(DILATE_MM * px_per_mm))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * r + 1, 2 * r + 1))
     dilated = cv2.dilate(binary, kernel)
     cv2.imwrite("maze_dilated.png", dilated * 255)
-    return dilated.tolist()
+
+    contours, hierarchy = cv2.findContours(blue, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    x, y, w, h, x2, y2, w2, h2 = cv2.boundingRect(sorted_contours[0]), cv2.boundingRect(sorted_contours[1])
+    mid_point_1 = (x+(w/2),y+(h/2))
+    mid_point_2 = (x2+(w2/2),y2+(h2/2))
+    if mid_point_1[0] >= mid_point_1[1]:
+        temp = mid_point_1
+        mid_point_1 = mid_point_2
+        mid_point_2 = temp
+    return dilated.tolist(), mid_point_1, mid_point_2
